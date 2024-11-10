@@ -28,5 +28,5 @@ def find_deepest_metadata_key(data, search_key):
             if result is not None:
                 return result
 
-    # If no match is found, return None
+    # If no match is found, return None.
     return None
