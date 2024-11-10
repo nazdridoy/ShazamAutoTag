@@ -1,0 +1,460 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import asyncio
+from shazamio import Shazam
+from tqdm.asyncio import tqdm
+from unidecode import unidecode
+import argparse
+from urllib.request import urlopen
+from mutagen.mp3 import MP3
+from mutagen.oggopus import OggOpus
+from mutagen.easyid3 import EasyID3
+from mutagen.id3 import ID3, APIC, TPUB, TXXX
+import base64
+import struct
+
+from utils import find_deepest_metadata_key
+
+def update_audio_cover_art(file_path, cover_url, trace):
+    """
+    Update the cover art of the audio file using the image from the given URL.
+    Supports both MP3 and OPUS files.
+    """
+    if cover_url == "":
+        if trace:
+            print("\nNo cover found for ", file_path)
+        return
+
+    img_data = urlopen(cover_url).read()
+    
+    if file_path.lower().endswith('.mp3'):
+        audio = ID3(file_path)
+        audio.add(
+            APIC(
+                encoding=3,
+                mime='image/jpeg',
+                type=3,
+                desc='cover',
+                data=img_data
+            )
+        )
+        audio.save()
+    elif file_path.lower().endswith('.opus'):
+        mime_type = 'image/jpeg'
+        description = 'cover'
+        
+        # Pack data in correct order with proper byte alignment
+        data = (
+            struct.pack('>I', 3) +  # picture type
+            struct.pack('>I', len(mime_type)) +  # mime type length
+            mime_type.encode() +  # mime type string
+            struct.pack('>I', len(description)) +  # description length
+            description.encode() +  # description string
+            struct.pack('>I', 0) +  # width
+            struct.pack('>I', 0) +  # height
+            struct.pack('>I', 24) +  # color depth (assuming 24-bit color)
+            struct.pack('>I', 0) +  # number of colors used
+            struct.pack('>I', len(img_data)) +  # length of picture data
+            img_data  # actual picture data
+        )
+        
+        # Base64 encode the METADATA_BLOCK_PICTURE
+        encoded_data = base64.b64encode(data).decode('ascii')
+        
+        audio = OggOpus(file_path)
+        audio['METADATA_BLOCK_PICTURE'] = [encoded_data]  # Try as a list
+        audio.save()
+
+
+def update_audio_tags(file_path: str, title: str, artist: str, album: str, label: str = "", released: str = ""):
+    """
+    Update the audio tags of the given file. Supports both MP3 and OPUS files.
+    Parameters:
+        file_path: Path to the audio file
+        title: Song title
+        artist: Artist name
+        album: Album name
+        label: Record label name
+        released: Release year
+    """
+    if file_path.lower().endswith('.mp3'):
+        try:
+            # First try with EasyID3 for basic tags
+            audio = EasyID3(file_path)
+        except:
+            audio = MP3(file_path)
+            audio.add_tags()
+            audio.save()
+            audio = EasyID3(file_path)
+        
+        # Set basic tags
+        audio['title'] = title
+        audio['artist'] = artist
+        audio['album'] = album
+        audio.save()
+        
+        # Now handle the special tags that aren't in EasyID3
+        audio = ID3(file_path)
+        if label:
+            audio.add(TPUB(encoding=3, text=label))  # Publisher/Label tag
+        if released:
+            audio.add(TXXX(encoding=3, desc='originalyear', text=released))
+        
+    elif file_path.lower().endswith('.opus'):
+        try:
+            audio = OggOpus(file_path)
+            if 'title' not in audio or 'artist' not in audio or 'album' not in audio:
+                audio['title'] = []
+                audio['artist'] = []
+                audio['album'] = []
+        except:
+            audio = OggOpus(file_path)
+            audio.save()
+        
+        # Set basic tags
+        audio['title'] = title
+        audio['artist'] = artist
+        audio['album'] = album
+        
+        # Add label and release year with correct tag names
+        if label:
+            audio['LABEL'] = label
+        if released:
+            audio['ORIGINALYEAR'] = released
+    
+    audio.save()
+
+
+def sanitize_string(filename, trace):
+    """
+    Sanitize the filename to remove invalid characters, adjust casing, and transliterate to Latin characters.
+    Ensures the filename is not empty after transformations. If transliteration results in an empty string,
+    uses the original filename with non-Unicode characters.
+
+    Parameters:
+    - filename: The original filename to be sanitized.
+
+    Returns:
+    - A sanitized, safe filename with adjustments made for file system compatibility.
+    """
+    original_filename = filename  # Store the original filename
+    filename = unidecode(filename)  # Attempt to transliterate to ASCII
+
+    # Manually remove content within parentheses
+    new_filename = ""
+    skip = 0
+    for char in filename:
+        if char == "(":
+            skip += 1
+        elif char == ")" and skip > 0:
+            skip -= 1
+        elif skip == 0:
+            new_filename += char
+    filename = new_filename
+
+    # Revert to the original filename if transliteration results in an empty string
+    if not filename.strip():
+        filename = original_filename
+
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        # Remove invalid file name characters
+        filename = filename.replace(char, "")
+    filename = filename.replace("&", "-")  # Replace '&' with '-'
+    # Change uppercase words to capitalize (first letter uppercase, rest lowercase)
+    filename = " ".join(word.capitalize() for word in filename.split())
+
+    if not filename.strip():
+        if trace:
+            print("\nWarning: Filename became empty after sanitization.")
+        filename = "Unknown song"  # Default filename if all else fails
+
+    return filename
+
+
+async def recognize_and_rename_song(
+    file_path: str,
+    file_name: str,
+    shazam: Shazam,
+    modify=True,
+    delay=10,
+    nbrRetry=3,
+    trace=False,
+):
+    """
+    Recognize a song using Shazam, rename the MP3 file based on the song title and artist,
+    and update its tags and cover art accordingly.
+
+    Parameters:
+    - file_path: The path to the MP3 file to be recognized and renamed.
+    - shazam: An instance of the Shazam client.
+    """
+    attempt = 0
+    out = None
+    errorStr = ""
+    while attempt < nbrRetry:
+        try:
+            out = await shazam.recognize(file_path)
+            if out:  # Assuming 'out' being non-empty means success
+                break
+        except Exception as e:
+            errorStr = f"Exception : {e}"
+            print(errorStr)
+            attempt += 1
+        if attempt < nbrRetry:
+            # print(f"\nRetrying after {delay} seconds...")
+            await asyncio.sleep(delay)
+
+    if out is None:
+        if trace:
+            print(
+                f"\nFailed to recognize {file_name} after {nbrRetry} attempts. Error {errorStr}"
+            )
+        return {"file_path": file_name, "error": "Could not recognize file"}
+
+    # Extract necessary information from recognition result
+    track_info = out.get("track", {})
+    title = track_info.get("title", "Unknown Title")
+    author = track_info.get("subtitle", "Unknown Artist")
+    album = find_deepest_metadata_key(track_info, "Album") or "Unknown Album"
+    label = find_deepest_metadata_key(track_info, "Label")
+    released = find_deepest_metadata_key(track_info, "Released")
+    images = track_info.get("images", {})
+    cover_link = images.get("coverart", "")  # Default to empty if no cover art
+    if title == "Unknown Title" and trace:
+        print(f"\nCould not recognize {file_name}, will not modify it.")
+        return {"file_path": file_name, "error": "Could not recognize file"}
+
+    # Sanitize, rename, and update MP3 file
+    sanitized_title = sanitize_string(title, trace)
+    sanitized_author = sanitize_string(author, trace)
+    sanitized_album = sanitize_string(album, trace)
+    file_extension = os.path.splitext(file_path)[1].lower()
+    new_filename_components = [sanitized_title, sanitized_author, sanitized_album]
+    new_filename = " - ".join(filter(None, new_filename_components)) + file_extension
+    directory = os.path.dirname(file_path)
+    new_file_path = os.path.join(directory, new_filename)
+
+    # Check if a file with the new name already exists and append a number to make it unique
+    counter = 1
+    base_new_filename = new_filename
+    while os.path.exists(new_file_path):
+        if new_filename == file_name:
+            break
+        if trace:
+            print(
+                f"\nWarning: File {new_file_path} already exists. Trying a new name."
+            )
+        new_filename = (os.path.splitext(base_new_filename)[0] +
+                        f" ({counter})" +
+                        os.path.splitext(base_new_filename)[1])
+        new_file_path = os.path.join(directory, new_filename)
+        counter += 1
+
+    if modify:
+        os.rename(file_path, new_file_path)
+        try:
+            update_audio_tags(new_file_path, 
+                            sanitized_title, 
+                            sanitized_author, 
+                            sanitized_album,
+                            label,  # Add label
+                            released)  # Add release year
+        except Exception as e:
+            if trace:
+                print(f"\nError updating mp3 tag {file_path}: {e}")
+            return {"file_path": file_path, "error": str(e)}
+        try:
+            update_audio_cover_art(new_file_path, cover_link, trace)
+        except Exception as e:
+            if trace:
+                print(f"\nError updating cover {file_path}: {e}")
+
+    return {
+        "file_path": file_path,
+        "new_file_path": new_file_path,
+        "title": title,
+        "author": author,
+        "cover_link": cover_link,
+    }
+
+
+async def find_and_recognize_audio_files(folder_path,
+                                       modify=True,
+                                       delay=10,
+                                       nbrRetry=3,
+                                       trace=False):
+    audio_files_path = []
+    test_folder_name = "test"
+    if (test_folder_name in folder_path):
+        print("Cannot recognize audio files from a folder name \"test\". Please use another name.")
+        return
+    trace = True
+    for root, dirs, files in os.walk(folder_path):
+        if test_folder_name in os.path.split(root)[1].lower():
+            continue
+        for file in files:
+            if file.lower().endswith((".mp3", ".opus")):
+                audio_files_path.append([file, os.path.join(root, file)])
+
+    if len(audio_files_path) == 0:
+        print(f"No mp3 or opus files found in {folder_path} exit!")
+        return
+    shazam = Shazam()
+    results = []
+
+    # Process each MP3 file not in the 'test' folder
+    async for file_path in tqdm(audio_files_path,
+                                desc="Recognizing and Renaming Songs"):
+        result = await recognize_and_rename_song(file_path[1], file_path[0],
+                                                 shazam, modify, delay,
+                                                 nbrRetry, trace)
+        results.append(result)
+
+    action = ""
+    if modify:
+        action = "Renamed"
+    else:
+        action = "Will be renamed in:"
+    if trace:
+        print(
+            "\n\n------------------------------- End Recognize and Rename Process -------------------------------\n\n"
+        )
+    # Print results after all files have been processed
+    succeed = 0
+    for result in results:
+        if "error" not in result:
+            succeed += 1
+            if trace:
+                print(
+                    f"{action}: {result['file_path']} -> {result['new_file_path']}"
+                )
+        else:
+            if trace:
+                print(
+                    f"File: {result['file_path']} - Error: {result['error']}")
+    print(f"Succeed {succeed}/{len(results)}.")
+
+
+async def test():
+    test_folder = os.path.join(os.path.dirname(os.path.realpath(__file__)), "test")
+    
+    # Test both MP3 and OPUS files
+    test_files = {
+        "fileToTest.mp3": "Drive My Car - The Beatles - Rubber Soul.mp3",
+        "fileToTest.opus": "Drive My Car - The Beatles - Rubber Soul.opus"
+    }
+    
+    for test_file, expected_name in test_files.items():
+        test_file_path = os.path.join(test_folder, test_file)
+        expected_new_file_path = os.path.join(test_folder, expected_name)
+
+        # if the renamed file exists, rename it back to test file
+        if os.path.exists(expected_new_file_path):
+            os.rename(expected_new_file_path, test_file_path)
+
+        # Check if the test file exists
+        if not os.path.exists(test_file_path):
+            print(f"Error: The test file {test_file} does not exist, skipping this test.")
+            continue
+
+        # Apply the recognize_and_rename_song function
+        shazam = Shazam()
+        modify = True
+
+        await recognize_and_rename_song(test_file_path, test_file, shazam, modify)
+
+        # Check if the file was correctly renamed
+        if os.path.exists(expected_new_file_path):
+            print(f"Test Success: The file was correctly renamed to \"{expected_name}\".")
+            # Rename the file back to its original name for other tests
+            os.rename(expected_new_file_path, test_file_path)
+        else:
+            print(f"Test Failed: The file was not correctly renamed to {expected_name}.")
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("Boolean value expected.")
+
+
+async def main():
+    # Set up argument parsing
+    parser = argparse.ArgumentParser(
+        description=
+        "Process MP3 files with Shazam recognition and optional renaming and tagging."
+    )
+    parser.add_argument(
+        "-di",
+        "--directory",
+        help=
+        "Specify the directory to process MP3 files. (default is current folder)",
+        default=os.path.dirname(os.path.realpath(__file__)),
+    )
+    parser.add_argument("-te",
+                        "--test",
+                        action="store_true",
+                        help="Call the test function.")
+    parser.add_argument(
+        "-m",
+        "--modify",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=True,
+        help=
+        "Indicate if modifications to tag and file name should be applied. (default is true)",
+    )
+    parser.add_argument(
+        "-de",
+        "--delay",
+        type=int,
+        default=10,
+        help=
+        "Specify a delay in seconds between retries if the Shazam API call fails. (default 10 seconds, reduce it to improve performances)",
+    )
+    parser.add_argument(
+        "-n",
+        "--nbrRetry",
+        type=int,
+        default=10,
+        help=
+        "Specify the number of retries for Shazam API call if it fails. (default 10 try, reduce it to improve performances)",
+    )
+    parser.add_argument(
+        "-tr",
+        "--trace",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help=
+        "Enable tracing to print messages during the recognition and renaming process.",
+    )
+
+    args = parser.parse_args()
+
+    # Handle the test argument
+    if args.test:
+        await test()
+        return  # Exit after test function if test argument is provided
+
+    # Handle the directory argument
+    folder_path = (args.directory if args.directory else os.path.dirname(
+        os.path.realpath(__file__)))
+
+    await find_and_recognize_audio_files(args.directory, args.modify, args.delay,
+                                       args.nbrRetry, args.trace)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
