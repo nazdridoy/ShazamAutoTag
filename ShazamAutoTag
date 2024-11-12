@@ -14,6 +14,8 @@ from mutagen.easyid3 import EasyID3
 from mutagen.id3 import ID3, APIC, TPUB, TXXX
 import base64
 import struct
+from PIL import Image
+from io import BytesIO
 
 from utils import find_deepest_metadata_key
 
@@ -45,17 +47,23 @@ def update_audio_cover_art(file_path, cover_url, trace):
         mime_type = 'image/jpeg'
         description = 'cover'
         
-        # Pack data in correct order with proper byte alignment
+        # Get image dimensions and color info from the image data
+        img = Image.open(BytesIO(img_data))
+        width, height = img.size
+        depth = 24 if img.mode in ('RGB', 'RGBA') else 8
+        colors = 0  # 0 for true color images
+        
+        # Pack data with actual image dimensions
         data = (
             struct.pack('>I', 3) +  # picture type
             struct.pack('>I', len(mime_type)) +  # mime type length
             mime_type.encode() +  # mime type string
             struct.pack('>I', len(description)) +  # description length
             description.encode() +  # description string
-            struct.pack('>I', 0) +  # width
-            struct.pack('>I', 0) +  # height
-            struct.pack('>I', 24) +  # color depth (assuming 24-bit color)
-            struct.pack('>I', 0) +  # number of colors used
+            struct.pack('>I', width) +  # actual width
+            struct.pack('>I', height) +  # actual height
+            struct.pack('>I', depth) +  # actual color depth
+            struct.pack('>I', colors) +  # number of colors used
             struct.pack('>I', len(img_data)) +  # length of picture data
             img_data  # actual picture data
         )
