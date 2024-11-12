@@ -50,29 +50,40 @@ def update_audio_cover_art(file_path, cover_url, trace):
         # Get image dimensions and color info from the image data
         img = Image.open(BytesIO(img_data))
         width, height = img.size
-        depth = 24 if img.mode in ('RGB', 'RGBA') else 8
-        colors = 0  # 0 for true color images
         
-        # Pack data with actual image dimensions
+        # Set proper values for depth and colors based on image mode
+        if img.mode == 'RGB':
+            depth = 24
+        elif img.mode == 'RGBA':
+            depth = 32
+        else:
+            depth = 8
+            
+        # For indexed images (like PNG), get actual number of colors
+        if img.mode == 'P':
+            colors = len(img.getcolors())
+        else:
+            colors = 0  # Use 0 for true color images
+        
+        # Pack data with corrected image parameters
         data = (
             struct.pack('>I', 3) +  # picture type
-            struct.pack('>I', len(mime_type)) +  # mime type length
-            mime_type.encode() +  # mime type string
-            struct.pack('>I', len(description)) +  # description length
-            description.encode() +  # description string
-            struct.pack('>I', width) +  # actual width
-            struct.pack('>I', height) +  # actual height
-            struct.pack('>I', depth) +  # actual color depth
-            struct.pack('>I', colors) +  # number of colors used
-            struct.pack('>I', len(img_data)) +  # length of picture data
-            img_data  # actual picture data
+            struct.pack('>I', len(mime_type)) +
+            mime_type.encode() +
+            struct.pack('>I', len(description)) +
+            description.encode() +
+            struct.pack('>I', width) +
+            struct.pack('>I', height) +
+            struct.pack('>I', depth) +  # corrected depth
+            struct.pack('>I', colors) +  # corrected colors
+            struct.pack('>I', len(img_data)) +
+            img_data
         )
         
-        # Base64 encode the METADATA_BLOCK_PICTURE
+        # Base64 encode and save
         encoded_data = base64.b64encode(data).decode('ascii')
-        
         audio = OggOpus(file_path)
-        audio['METADATA_BLOCK_PICTURE'] = [encoded_data]  # Try as a list
+        audio['METADATA_BLOCK_PICTURE'] = [encoded_data]
         audio.save()
 
 
